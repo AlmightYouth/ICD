@@ -1311,6 +1311,7 @@ class GenerationMixin:
         synced_gpus: Optional[bool] = None,
         assistant_model: Optional["PreTrainedModel"] = None,
         streamer: Optional["BaseStreamer"] = None,
+        student_input_ids: Optional[torch.Tensor] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         dola_decoding: Optional[bool] = None,
@@ -1622,6 +1623,20 @@ class GenerationMixin:
                     # raise ValueError(
                     #     f"student_model has to be provided when doing contrastive decoding."
                     # )
+                    if student_input_ids is not None:
+                        return self.dual_contrastive_greedy_decode(
+                            teacher_input_ids=input_ids,
+                            student_model=student_model,
+                            student_input_ids=student_input_ids,
+                            logits_processor=logits_processor,
+                            stopping_criteria=stopping_criteria,
+                            pad_token_id=generation_config.pad_token_id,
+                            eos_token_id=generation_config.eos_token_id,
+                            synced_gpus=synced_gpus,
+                            relative_top=relative_top,
+                            streamer=streamer,
+                            **model_kwargs,
+                        )
                     return self.contrastive_greedy_decode(
                         input_ids,
                         student_model=student_model,
@@ -2324,6 +2339,102 @@ class GenerationMixin:
         else:
             return input_ids
 
+    def dual_contrastive_greedy_decode(
+        self,
+        teacher_input_ids: torch.LongTensor,
+        student_model: torch.nn.Module,
+        student_input_ids: torch.LongTensor,
+        relative_top: float = 0.1,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_new_tokens: int = 20,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        synced_gpus: Optional[bool] = False,
+        streamer: Optional["BaseStreamer"] = None,
+        v2: bool = True,
+        **model_kwargs,
+    ) -> torch.LongTensor:
+        """Contrastive greedy decoding using separate prompts for teacher and student models."""
+
+        logits_processor = logits_processor or LogitsProcessorList()
+        stopping_criteria = stopping_criteria or StoppingCriteriaList()
+        stopping_criteria = validate_stopping_criteria(stopping_criteria, max_new_tokens)
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+
+        teacher_ids = teacher_input_ids.clone()
+        student_ids = student_input_ids.clone()
+        eos_tensor = torch.tensor([eos_token_id]).to(teacher_ids.device) if eos_token_id is not None else None
+        unfinished_sequences = torch.ones(teacher_ids.shape[0], dtype=torch.long, device=teacher_ids.device)
+
+        teacher_kwargs = copy.deepcopy(model_kwargs)
+        student_kwargs = copy.deepcopy(model_kwargs)
+
+        while True:
+            if synced_gpus:
+                this_peer_finished_flag = torch.tensor(0.0 if unfinished_sequences.max() > 0 else 1.0).to(teacher_ids.device)
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            teacher_inputs = self.prepare_inputs_for_generation(teacher_ids, **teacher_kwargs)
+            student_inputs = student_model.prepare_inputs_for_generation(student_ids, **student_kwargs)
+
+            teacher_out = self(**teacher_inputs, return_dict=True)
+            student_out = student_model(**student_inputs, return_dict=True)
+
+            final_logits = teacher_out.logits[:, -1, :]
+            base_logits = student_out.logits[:, -1, :]
+
+            if v2:
+                final_probs = final_logits.softmax(dim=-1)
+                base_probs = base_logits.softmax(dim=-1)
+                if relative_top > 0.0:
+                    final_probs = self.relative_top_filter_probs(final_logits, relative_top)
+                    mask = final_logits[0] == 0.0
+                    base_probs[0][mask] = 0.0
+                diff_probs = torch.nn.functional.relu(final_probs - base_probs)
+                next_scores = (final_probs + diff_probs).softmax(dim=-1)
+            else:
+                if relative_top > 0.0:
+                    final_logits = self.relative_top_filter(final_logits, relative_top)
+                    base_logits = base_logits.log_softmax(dim=-1)
+                    mask = final_logits[0] < -1e3
+                    base_logits[0][mask] = -1e3
+                logits = final_logits - base_logits
+                next_scores = logits_processor(teacher_ids, logits)
+
+            next_tokens = torch.argmax(next_scores, dim=-1)
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            teacher_ids = torch.cat([teacher_ids, next_tokens[:, None]], dim=-1)
+            student_ids = torch.cat([student_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+
+            teacher_kwargs = self._update_model_kwargs_for_generation(
+                teacher_out, teacher_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+            student_kwargs = student_model._update_model_kwargs_for_generation(
+                student_out, student_kwargs, is_encoder_decoder=student_model.config.is_encoder_decoder
+            )
+
+            if eos_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_tensor.shape[0], 1).ne(eos_tensor.unsqueeze(1)).prod(dim=0)
+                )
+
+            if unfinished_sequences.max() == 0 or stopping_criteria(teacher_ids, None):
+                break
+
+        if streamer is not None:
+            streamer.end()
+
+        return teacher_ids
 
     def contrastive_greedy_decode(
         self,
