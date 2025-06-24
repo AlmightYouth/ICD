@@ -113,10 +113,9 @@ class ContrastiveDecoding:
         self.stopping_criteria.append(LLamaQaStoppingCriteria(list_stop_word_ids))
 
     def generate(self, input_text=None, evil_input_text=None, input_ids=None, max_new_tokens=256, top_p=0.95, top_k=0, temperature=0.8, 
-                 mature_layer=None, premature_layer=None, candidate_premature_layers=[], 
-                 mode='baseline', verbose=True, remove_stop_words=False, relative_top=0.1, 
-                 **kwargs):
-        #TODO: Prompt-based Contrastive Decoding for generating content
+                mature_layer=None, premature_layer=None, candidate_premature_layers=[], 
+                mode='baseline', verbose=True, remove_stop_words=False, relative_top=0.1, first_gen_mode="greedy", **kwargs):
+            #TODO: Prompt-based Contrastive Decoding for generating content
         """_summary_
 
         Args:
@@ -145,7 +144,6 @@ class ContrastiveDecoding:
                 evil_input_ids = self.tokenizer(evil_input_text, return_tensors="pt").input_ids.to(self.device)
             
             max_len = input_ids.shape[-1] + max_new_tokens
-
             if mode == 'baseline':
                 outputs = self.model.generate(input_ids, max_length=max_len, num_return_sequences=1,
                                     output_scores=True, return_dict_in_generate=True, dola_decoding=False,
@@ -171,6 +169,37 @@ class ContrastiveDecoding:
                     output_scores=True, return_dict_in_generate=True, contrastive_decoding=True,
                     student_model=self.amateur_model,
                     top_p=top_p, top_k=top_k, temperature=temperature, stopping_criteria=self.stopping_criteria, relative_top=relative_top, **kwargs)
+            elif mode == "dual-contrastive-decoding":
+                assert self.amateur_model is not None, "amateur model must be specified if using contrastive decoding"
+
+                first_gen_mode_param = first_gen_mode  
+                if first_gen_mode_param == "greedy":
+                    first_outputs = self.model.generate(input_ids, max_length=max_len, num_return_sequences=1,
+                                    output_scores=True, return_dict_in_generate=True, dola_decoding=False,
+                                    top_p=top_p, top_k=top_k, temperature=temperature, stopping_criteria=self.stopping_criteria, **kwargs)
+                        
+                elif first_gen_mode_param == "contrastive":
+                    first_outputs = self.model.generate(input_ids, max_length=max_len, num_return_sequences=1,
+                        output_scores=True, return_dict_in_generate=True, contrastive_decoding=True,
+                        student_model=self.amateur_model,
+                        top_p=top_p, top_k=top_k, temperature=temperature, stopping_criteria=self.stopping_criteria, relative_top=relative_top, **kwargs)
+                        
+
+                question_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                first_response = self.tokenizer.decode(first_outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+                conv_prefix = (f"User: {question_text}\n"
+                                f"Assistant: {first_response}\n"
+                                f"User: {question_text}\n"
+                                f"Assistant: ")
+                
+                teacher_input_ids = self.tokenizer(conv_prefix, return_tensors="pt").input_ids.to(input_ids.device)
+
+                outputs = self.model.generate(input_ids=teacher_input_ids,student_input_ids=input_ids, max_length=max_len, num_return_sequences=1,
+                        output_scores=True, return_dict_in_generate=True, contrastive_decoding=True,
+                        student_model=self.amateur_model,
+                        top_p=top_p, top_k=top_k, temperature=temperature, stopping_criteria=self.stopping_criteria, relative_top=relative_top, **kwargs)
+                return outputs, self.tokenizer.decode(outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+            
             elif mode == "prompt-contrastive-decoding":
                 assert evil_input_text is not None, "amateur model must be specified if using contrastive decoding"
                 outputs = self.model.generate(input_ids, evil_input_ids=evil_input_ids, max_length=max_len, num_return_sequences=1,
